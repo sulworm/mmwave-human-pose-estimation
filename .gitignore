@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+AGENT.md
 
 # Python environments
 .venv/
@@ -15,9 +16,6 @@ env/
 Data_Matched/
 Data_Aligned/
 Dataset_Ready/
-Data_With_Pred/
-Training_Results/
-animations/
 *.npy
 *.npz
 *.pth
@@ -31,3 +29,11 @@ animations/
 *.log
 .DS_Store
 Thumbs.db
+
+# Generated outputs intentionally published with the project
+!Data_With_Pred/
+!Data_With_Pred/**
+!Training_Results/
+!Training_Results/**
+!animations/
+!animations/**
