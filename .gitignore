@@ -1,0 +1,33 @@
+# Local tooling and caches
+.codex/
+.else/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Python environments
+.venv/
+venv/
+env/
+.env
+
+# Data, generated outputs, and model artifacts
+Data_Matched/
+Data_Aligned/
+Dataset_Ready/
+Data_With_Pred/
+Training_Results/
+animations/
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.mat
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
