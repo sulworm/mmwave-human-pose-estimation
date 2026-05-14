@@ -1,0 +1,7 @@
+{
+  "model_type": "mmchain_lite",
+  "input_channels": 5,
+  "radar_channels": "xyzvsnr",
+  "seq_len": 10,
+  "num_joints": 13
+}

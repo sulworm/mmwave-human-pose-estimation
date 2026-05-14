@@ -34,3 +34,10 @@ mmchain优化方法参考/
 *.log
 .DS_Store
 Thumbs.db
+
+# Published training artifacts
+!Training_Results*/
+!Training_Results*/best_model.pth
+!Training_Results*/best_model_config.json
+!Training_Results*/loss_curve.png
+!Training_Results*/training_log.json

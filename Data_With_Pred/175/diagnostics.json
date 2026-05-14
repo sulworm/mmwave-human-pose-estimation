@@ -1,8 +1,0 @@
-{
-  "mpjpe": 0.07612686604261398,
-  "lower_body_mpjpe": 0.079585961997509,
-  "knee_foot_mpjpe": 0.09793336689472198,
-  "leg_velocity_error": 0.008975652046501637,
-  "foot_motion_ratio": 4.254947399071022,
-  "phase_delay_frames": -6
-}

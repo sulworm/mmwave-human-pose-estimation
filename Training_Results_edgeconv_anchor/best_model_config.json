@@ -1,0 +1,7 @@
+{
+  "model_type": "edgeconv_anchor",
+  "input_channels": 3,
+  "radar_channels": "xyz",
+  "seq_len": 10,
+  "num_joints": 13
+}

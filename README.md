@@ -41,6 +41,12 @@ C:\Apps\anaconda3\envs\pose\python.exe visualize.py
 - `Dataset_Ready/split_info.json` records per-sample action buckets for balanced training and diagnostics.
 - `train_net.py` defaults to action-bucket balanced sampling, train-only point-cloud augmentation, joint-weighted pose loss, and extra lower-body temporal losses.
 - `inference.py` and `visualize.py` report lower-body MPJPE, knee/foot MPJPE, leg velocity error, foot-motion ratio, and phase-delay diagnostics.
+- `model.py` is the shared model definition used by both `train_net.py` and `inference.py`.
+- `--model_type baseline` keeps the original PointNet + Transformer model.
+- `--model_type edgeconv_anchor` enables RadarChainPoseNet-lite with EdgeConv point geometry, latent anchor tokens, spatial token mixing, and temporal token mixing.
+- `--model_type mmchain_lite` enables the mmChainPose-inspired path with EdgeConv point features, fixed 3D anchor aggregation, geometry-aware chained cross-attention, and an MLP pose head.
+- `--model_type mmchain_lite_st` enables the mmChainPose-lite spatio-temporal variant that flattens time and anchor tokens before Transformer mixing.
+- `process_data.py --radar_channels xyzvsnr --seq_len 5` is now the default; `xyz` and `xyzv` remain available for ablation.
 
 ## 当前训练逻辑
 
@@ -87,6 +93,19 @@ C:\Apps\anaconda3\envs\pose\python.exe process_data.py
 C:\Apps\anaconda3\envs\pose\python.exe train_net.py
 ```
 
+训练新网络：
+
+```powershell
+C:\Apps\anaconda3\envs\pose\python.exe train_net.py --model_type edgeconv_anchor
+```
+
+训练 mmChainPose-lite 优化网络：
+
+```powershell
+C:\Apps\anaconda3\envs\pose\python.exe process_data.py --radar_channels xyzvsnr --seq_len 5
+C:\Apps\anaconda3\envs\pose\python.exe train_net.py --model_type mmchain_lite
+```
+
 推理并可视化：
 
 ```powershell
@@ -103,6 +122,14 @@ C:\Apps\anaconda3\envs\pose\python.exe visualize.py
 - `Dataset_Ready`：训练和测试张量数据，会被 `process_data.py` 覆盖。
 - `Training_Results`：训练输出和最佳模型权重，会被 `train_net.py` 覆盖。
 - `Data_With_Pred`：推理结果和可视化所需数据，会被 `inference.py` 覆盖。
+
+## 仓库数据发布说明
+
+本仓库当前不上传原始数据集、对齐后的数据集、打包后的训练张量，以及 `Data_With_Pred*` 推理输出目录。
+
+原因是这些目录包含雷达点云、IMU/骨架标签、处理后的中间数据或模型推理结果，属于实验数据和派生数据。为避免在论文正式产出前暴露数据细节、实验划分和中间结果，数据集将在后续论文完成后再整理并完整上传。
+
+当前会保留并上传 `Training_Results*` 中的训练结果，包括训练日志、loss 曲线、模型配置和最佳模型权重，用于记录不同模型版本的实验结果。
 
 ## 数据可用性记录
 
