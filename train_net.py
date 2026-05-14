@@ -7,22 +7,24 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
+from model import MODEL_TYPES, build_model
+
 
 DATA_DIR = "Dataset_Ready"
 SAVE_DIR = "Training_Results"
-SEQ_LEN = 10
-BATCH_SIZE = 32
+SEQ_LEN = 5
+BATCH_SIZE = 128
 EPOCHS = 8
 LEARNING_RATE = 0.001
 BONE_WEIGHT = 0.2
-VELOCITY_WEIGHT = 0.1
-LEG_VELOCITY_WEIGHT = 0.2
-LEG_ACCEL_WEIGHT = 0.05
+VELOCITY_WEIGHT = 0.05
+LEG_VELOCITY_WEIGHT = 0.1
+LEG_ACCEL_WEIGHT = 0.02
+ROOT_RELATIVE_WEIGHT = 0.05
 YAW_AUG_DEG = 8.0
 POINT_JITTER_STD = 0.01
 POINT_DROPOUT = 0.08
@@ -85,6 +87,10 @@ class ReadyDataset(Dataset):
         self.center = data["center"]  # (N, 10, 3)
         self.groups = data.get("groups", [])
         self.sample_buckets = data.get("sample_buckets", ["unknown"] * len(self.radar))
+        self.config = data.get("config", {})
+        self.input_channels = int(self.radar.shape[-1])
+        self.seq_len = int(self.radar.shape[1])
+        self.radar_channels = self.config.get("radar_channels", "xyz")
         self.augment = augment
         self.yaw_aug_deg = float(yaw_aug_deg)
         self.jitter_std = float(jitter_std)
@@ -108,9 +114,9 @@ class ReadyDataset(Dataset):
                 pose_local = rotate_xy_tensor(pose_local, angle)
                 pose_global = pose_local + center.unsqueeze(1)
 
-            valid = torch.any(torch.abs(radar) > 1e-6, dim=-1, keepdim=True)
+            valid = torch.any(torch.abs(radar[..., :3]) > 1e-6, dim=-1, keepdim=True)
             if self.jitter_std > 0:
-                radar = radar + torch.randn_like(radar) * self.jitter_std * valid
+                radar[..., :3] = radar[..., :3] + torch.randn_like(radar[..., :3]) * self.jitter_std * valid
             if self.point_dropout > 0:
                 keep = (torch.rand(radar.shape[:-1], dtype=radar.dtype) > self.point_dropout).unsqueeze(-1)
                 radar = radar * keep
@@ -127,54 +133,6 @@ def build_bucket_sampler(dataset):
         return None
     weights = torch.tensor([1.0 / counts[bucket] for bucket in buckets], dtype=torch.double)
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-
-class PointNetEncoder(nn.Module):
-    def __init__(self, emb_dim=256):
-        super().__init__()
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, emb_dim, 1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(emb_dim)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        x = self.bn3(self.conv3(x))
-        return torch.max(x, 2)[0]
-
-
-class RadarPoseNet(nn.Module):
-    def __init__(self, num_joints=13, seq_len=SEQ_LEN):
-        super().__init__()
-        self.emb_dim = 256
-        self.spatial_encoder = PointNetEncoder(emb_dim=self.emb_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, self.emb_dim) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.emb_dim,
-            nhead=4,
-            dim_feedforward=512,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
-        self.regressor = nn.Sequential(
-            nn.Linear(self.emb_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_joints * 3),
-        )
-
-    def forward(self, x):
-        batch_size, seq_len, channels, point_count = x.shape
-        x_flat = x.reshape(batch_size * seq_len, channels, point_count)
-        feats = self.spatial_encoder(x_flat)
-        feats = feats.reshape(batch_size, seq_len, -1) + self.pos_embedding[:, :seq_len, :]
-        temp_feats = self.transformer(feats)
-        return self.regressor(temp_feats).view(batch_size, seq_len, 13, 3)
 
 
 def mpjpe(pred, gt):
@@ -247,9 +205,11 @@ def total_loss(
     velocity_weight=VELOCITY_WEIGHT,
     leg_velocity_weight=LEG_VELOCITY_WEIGHT,
     leg_accel_weight=LEG_ACCEL_WEIGHT,
+    root_relative_weight=ROOT_RELATIVE_WEIGHT,
 ):
     pose_loss = weighted_mpjpe(pred, gt, JOINT_WEIGHTS)
     plain_pose_loss = mpjpe(pred, gt)
+    root_loss = root_relative_mpjpe(pred, gt)
     bone_loss = bone_length_loss(pred, gt)
     vel_loss = temporal_velocity_loss(pred, gt)
     leg_vel_loss = temporal_velocity_loss(pred, gt, LOWER_BODY_JOINTS)
@@ -260,10 +220,12 @@ def total_loss(
         + velocity_weight * vel_loss
         + leg_velocity_weight * leg_vel_loss
         + leg_accel_weight * leg_acc_loss
+        + root_relative_weight * root_loss
     )
     return loss, {
         "mpjpe": plain_pose_loss,
         "weighted_mpjpe": pose_loss,
+        "root_relative": root_loss,
         "bone": bone_loss,
         "velocity": vel_loss,
         "leg_velocity": leg_vel_loss,
@@ -280,7 +242,28 @@ def mean_pose_baseline(train_set, test_set):
     }
 
 
-def evaluate(model, loader, device, bone_weight, velocity_weight, leg_velocity_weight, leg_accel_weight):
+def save_model_config(save_dir, args, train_set):
+    config = {
+        "model_type": args.model_type,
+        "input_channels": train_set.input_channels,
+        "radar_channels": train_set.radar_channels,
+        "seq_len": train_set.seq_len,
+        "num_joints": 13,
+    }
+    with open(os.path.join(save_dir, "best_model_config.json"), "w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2)
+
+
+def evaluate(
+    model,
+    loader,
+    device,
+    bone_weight,
+    velocity_weight,
+    leg_velocity_weight,
+    leg_accel_weight,
+    root_relative_weight,
+):
     model.eval()
     values = {
         "loss": [],
@@ -290,6 +273,7 @@ def evaluate(model, loader, device, bone_weight, velocity_weight, leg_velocity_w
         "root_translation_error": [],
         "lower_body_mpjpe": [],
         "knee_foot_mpjpe": [],
+        "root_relative_loss": [],
         "bone_loss": [],
         "velocity_loss": [],
         "leg_velocity_loss": [],
@@ -315,6 +299,7 @@ def evaluate(model, loader, device, bone_weight, velocity_weight, leg_velocity_w
                 velocity_weight,
                 leg_velocity_weight,
                 leg_accel_weight,
+                root_relative_weight,
             )
 
             values["loss"].append(loss.item())
@@ -324,6 +309,7 @@ def evaluate(model, loader, device, bone_weight, velocity_weight, leg_velocity_w
             values["root_translation_error"].append(mpjpe(pred_global[:, :, :1, :], pose_global[:, :, :1, :]).item())
             values["lower_body_mpjpe"].append(subset_mpjpe(pred_global, pose_global, LOWER_BODY_JOINTS).item())
             values["knee_foot_mpjpe"].append(subset_mpjpe(pred_global, pose_global, KNEE_FOOT_JOINTS).item())
+            values["root_relative_loss"].append(parts["root_relative"].item())
             values["bone_loss"].append(parts["bone"].item())
             values["velocity_loss"].append(parts["velocity"].item())
             values["leg_velocity_loss"].append(parts["leg_velocity"].item())
@@ -352,6 +338,8 @@ def parse_args():
     parser.add_argument("--velocity_weight", type=float, default=VELOCITY_WEIGHT)
     parser.add_argument("--leg_velocity_weight", type=float, default=LEG_VELOCITY_WEIGHT)
     parser.add_argument("--leg_accel_weight", type=float, default=LEG_ACCEL_WEIGHT)
+    parser.add_argument("--root_relative_weight", type=float, default=ROOT_RELATIVE_WEIGHT)
+    parser.add_argument("--model_type", choices=MODEL_TYPES, default="baseline")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_augment", action="store_true")
     parser.add_argument("--yaw_aug_deg", type=float, default=YAW_AUG_DEG)
@@ -387,18 +375,34 @@ def train():
     if bucket_counts:
         print(f"Train action buckets: {dict(sorted(bucket_counts.items()))}")
     print(f"Balanced sampling: {'off' if sampler is None else 'on'} | Augment: {'off' if args.no_augment else 'on'}")
+    print(
+        f"Model: {args.model_type} | "
+        f"Radar channels: {train_set.radar_channels} ({train_set.input_channels}) | "
+        f"seq_len={train_set.seq_len}"
+    )
 
     baseline = mean_pose_baseline(train_set, test_set)
     print(f"Mean-pose baseline local MPJPE: {baseline['mean_pose_local_mpjpe']:.4f}m")
     print(f"Mean-pose baseline root-relative MPJPE: {baseline['mean_pose_root_relative_mpjpe']:.4f}m")
 
-    model = RadarPoseNet(seq_len=SEQ_LEN).to(device)
+    model = build_model(
+        model_type=args.model_type,
+        input_channels=train_set.input_channels,
+        seq_len=train_set.seq_len,
+        num_joints=13,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     history = {
         "baseline": baseline,
         "epochs": [],
-        "config": vars(args) | {"device": str(device)},
+        "config": vars(args)
+        | {
+            "device": str(device),
+            "input_channels": train_set.input_channels,
+            "radar_channels": train_set.radar_channels,
+            "seq_len": train_set.seq_len,
+        },
     }
     best_local_mpjpe = float("inf")
 
@@ -426,6 +430,7 @@ def train():
                 args.velocity_weight,
                 args.leg_velocity_weight,
                 args.leg_accel_weight,
+                args.root_relative_weight,
             )
             loss.backward()
             optimizer.step()
@@ -442,6 +447,7 @@ def train():
             args.velocity_weight,
             args.leg_velocity_weight,
             args.leg_accel_weight,
+            args.root_relative_weight,
         )
         train_loss = float(np.mean(train_losses))
         train_local_mpjpe = float(np.mean(train_mpjpe))
@@ -463,6 +469,7 @@ def train():
         if metrics["local_mpjpe"] < best_local_mpjpe:
             best_local_mpjpe = metrics["local_mpjpe"]
             torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+            save_model_config(args.save_dir, args, train_set)
             print("  >>> Best model saved")
 
         with open(os.path.join(args.save_dir, "training_log.json"), "w", encoding="utf-8") as handle:

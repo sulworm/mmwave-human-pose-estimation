@@ -5,18 +5,22 @@ import sys
 
 import numpy as np
 import torch
-import torch.nn as nn
 from tqdm import tqdm
+
+from model import MODEL_TYPES, build_model
 
 
 SOURCE_DIR = "Data_Aligned"
 OUTPUT_DIR = "Data_With_Pred"
 MODEL_PATH = "Training_Results/best_model.pth"
-SEQ_LEN = 10
+SEQ_LEN = 5
 NUM_POINTS = 128
 SEED = 42
 DEFAULT_GROUPS = "54-108,131-204"
 DEFAULT_EXCLUDE_GROUPS = "5-44,111-126"
+RADAR_CHANNEL_CHOICES = ("xyz", "xyzv", "xyzvsnr")
+VELOCITY_CLIP = 1.5
+SNR_LOG_SCALE = 12.0
 LOWER_BODY_JOINTS = [1, 2, 3, 4, 5, 6]
 KNEE_FOOT_JOINTS = [2, 3, 5, 6]
 FOOT_JOINTS = [3, 6]
@@ -27,59 +31,20 @@ ROUGH_XY_RANGE = (-3.5, 3.5)
 ROUGH_Z_RANGE = (-0.5, 2.5)
 
 
-class PointNetEncoder(nn.Module):
-    def __init__(self, emb_dim=256):
-        super().__init__()
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, emb_dim, 1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(emb_dim)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        x = self.bn3(self.conv3(x))
-        return torch.max(x, 2)[0]
-
-
-class RadarPoseNet(nn.Module):
-    def __init__(self, num_joints=13, seq_len=SEQ_LEN):
-        super().__init__()
-        self.emb_dim = 256
-        self.spatial_encoder = PointNetEncoder(emb_dim=self.emb_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, self.emb_dim) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.emb_dim,
-            nhead=4,
-            dim_feedforward=512,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
-        self.regressor = nn.Sequential(
-            nn.Linear(self.emb_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_joints * 3),
-        )
-
-    def forward(self, x):
-        batch_size, seq_len, channels, point_count = x.shape
-        x_flat = x.reshape(batch_size * seq_len, channels, point_count)
-        feats = self.spatial_encoder(x_flat)
-        feats = feats.reshape(batch_size, seq_len, -1) + self.pos_embedding[:, :seq_len, :]
-        temp_feats = self.transformer(feats)
-        return self.regressor(temp_feats).view(batch_size, seq_len, 13, 3)
-
-
 def safe_torch_load(path, map_location=None):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def load_model_config(model_path, config_path=None):
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(model_path), "best_model_config.json")
+    if not config_path or not os.path.exists(config_path):
+        return {}
+    with open(config_path, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def sort_group_ids(group_ids):
@@ -129,12 +94,31 @@ def filter_group_ids(group_ids, include_spec=DEFAULT_GROUPS, exclude_spec=DEFAUL
     return sort_group_ids(group_ids)
 
 
-def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
-    if points_xyz.size == 0:
-        center = np.zeros(3, dtype=np.float32) if prev_center is None else prev_center.astype(np.float32)
-        return center, np.zeros((0, 3), dtype=np.float32)
+def radar_channel_count(radar_channels):
+    if radar_channels == "xyz":
+        return 3
+    if radar_channels == "xyzv":
+        return 4
+    if radar_channels == "xyzvsnr":
+        return 5
+    raise ValueError(f"Unsupported radar_channels: {radar_channels}")
 
-    rough_mask = (
+
+def select_radar_channels(radar_data, radar_channels):
+    feature_count = radar_channel_count(radar_channels)
+    features = np.zeros((radar_data.shape[0], feature_count), dtype=np.float32)
+    copy_count = min(feature_count, radar_data.shape[1])
+    if copy_count > 0:
+        features[:, :copy_count] = radar_data[:, :copy_count].astype(np.float32)
+    if feature_count >= 4:
+        features[:, 3] = np.clip(features[:, 3], -VELOCITY_CLIP, VELOCITY_CLIP) / VELOCITY_CLIP
+    if feature_count >= 5:
+        features[:, 4] = np.log1p(np.maximum(features[:, 4], 0.0)) / SNR_LOG_SCALE
+    return features
+
+
+def rough_point_mask(points_xyz):
+    return (
         (points_xyz[:, 0] >= ROUGH_XY_RANGE[0])
         & (points_xyz[:, 0] <= ROUGH_XY_RANGE[1])
         & (points_xyz[:, 1] >= ROUGH_XY_RANGE[0])
@@ -142,6 +126,14 @@ def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
         & (points_xyz[:, 2] >= ROUGH_Z_RANGE[0])
         & (points_xyz[:, 2] <= ROUGH_Z_RANGE[1])
     )
+
+
+def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
+    if points_xyz.size == 0:
+        center = np.zeros(3, dtype=np.float32) if prev_center is None else prev_center.astype(np.float32)
+        return center, np.zeros((0, 3), dtype=np.float32)
+
+    rough_mask = rough_point_mask(points_xyz)
     valid_points = points_xyz[rough_mask]
     if valid_points.shape[0] == 0:
         valid_points = points_xyz
@@ -158,7 +150,8 @@ def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
 
 def crop_local_points(local_points):
     if local_points.size == 0:
-        return np.zeros((0, 3), dtype=np.float32)
+        feature_count = local_points.shape[1] if local_points.ndim == 2 else 3
+        return np.zeros((0, feature_count), dtype=np.float32)
 
     mask = (
         (local_points[:, 0] >= -LOCAL_CROP_BOX)
@@ -172,6 +165,7 @@ def crop_local_points(local_points):
 
 
 def sample_or_pad(points_xyz, rng, num_points=NUM_POINTS):
+    feature_count = points_xyz.shape[1] if points_xyz.ndim == 2 else 3
     point_count = points_xyz.shape[0]
     if point_count >= num_points:
         indices = rng.choice(point_count, num_points, replace=False)
@@ -180,15 +174,20 @@ def sample_or_pad(points_xyz, rng, num_points=NUM_POINTS):
         extra_indices = rng.choice(point_count, num_points - point_count, replace=True)
         sampled = np.vstack([points_xyz, points_xyz[extra_indices]])
         return sampled.astype(np.float32)
-    return np.zeros((num_points, 3), dtype=np.float32)
+    return np.zeros((num_points, feature_count), dtype=np.float32)
 
 
-def preprocess_radar_frame(radar_data, prev_center, rng):
+def preprocess_radar_frame(radar_data, prev_center, rng, radar_channels="xyzvsnr"):
     points_xyz = radar_data[:, :3].astype(np.float32)
     center, valid_world = estimate_center(points_xyz, prev_center=prev_center)
-    radar_local = crop_local_points(valid_world - center)
+    rough_mask = rough_point_mask(points_xyz)
+    if points_xyz.shape[0] > 0 and not np.any(rough_mask):
+        rough_mask = np.ones(points_xyz.shape[0], dtype=bool)
+    radar_features = select_radar_channels(radar_data[rough_mask], radar_channels)
+    radar_features[:, :3] = valid_world - center
+    radar_local = crop_local_points(radar_features)
     radar_sampled = sample_or_pad(radar_local, rng=rng)
-    return radar_sampled, center
+    return radar_sampled, radar_sampled[:, :3].copy(), center
 
 
 def build_padded_windows(frames, seq_len=SEQ_LEN):
@@ -282,6 +281,10 @@ def parse_args():
     parser.add_argument("--source_dir", default=SOURCE_DIR)
     parser.add_argument("--output_dir", default=OUTPUT_DIR)
     parser.add_argument("--model_path", default=MODEL_PATH)
+    parser.add_argument("--model_config", default=None, help="Optional config saved by train_net.py.")
+    parser.add_argument("--model_type", choices=("auto",) + MODEL_TYPES, default="auto")
+    parser.add_argument("--radar_channels", choices=("auto",) + RADAR_CHANNEL_CHOICES, default="auto")
+    parser.add_argument("--seq_len", type=int, default=None, help="Override sequence length when no model config is present.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--groups", default=DEFAULT_GROUPS, help="Included group ids/ranges, or 'all'.")
@@ -296,8 +299,23 @@ def run_inference():
         print(f"错误：找不到模型权重文件 {args.model_path}。请先运行 train_net.py。")
         return
 
+    model_config = load_model_config(args.model_path, args.model_config)
+    model_type = model_config.get("model_type", "baseline") if args.model_type == "auto" else args.model_type
+    radar_channels = (
+        model_config.get("radar_channels", "xyzvsnr")
+        if args.radar_channels == "auto"
+        else args.radar_channels
+    )
+    input_channels = int(model_config.get("input_channels", radar_channel_count(radar_channels)))
+    seq_len = int(model_config.get("seq_len", args.seq_len if args.seq_len is not None else SEQ_LEN))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = RadarPoseNet(seq_len=SEQ_LEN).to(device)
+    model = build_model(
+        model_type=model_type,
+        input_channels=input_channels,
+        seq_len=seq_len,
+        num_joints=int(model_config.get("num_joints", 13)),
+    ).to(device)
     model.load_state_dict(safe_torch_load(args.model_path, map_location=device))
     model.eval()
 
@@ -312,11 +330,17 @@ def run_inference():
         "source_groups": source_groups,
         "groups_spec": args.groups,
         "exclude_groups": args.exclude_groups,
+        "model_type": model_type,
+        "radar_channels": radar_channels,
+        "input_channels": input_channels,
+        "seq_len": seq_len,
         "group_metrics": {},
     }
 
     print(f"开始推理 {len(groups)} / {len(source_groups)} 个组的数据，device={device}")
     print(f"使用组范围: {args.groups} | 排除组范围: {args.exclude_groups}")
+
+    print(f"Model: {model_type} | Radar channels: {radar_channels} ({input_channels}) | seq_len={seq_len}")
 
     for group in tqdm(groups, disable=not sys.stderr.isatty()):
         source_group = os.path.join(args.source_dir, group)
@@ -335,7 +359,8 @@ def run_inference():
         if frame_count < 1:
             continue
 
-        radar_local_frames = []
+        radar_feature_frames = []
+        radar_local_xyz_frames = []
         centers = []
         gt_global = []
         gt_local = []
@@ -344,18 +369,25 @@ def run_inference():
         for frame_idx in range(frame_count):
             radar_data = np.load(os.path.join(radar_dir, radar_files[frame_idx]))
             imu_data = np.load(os.path.join(imu_dir, imu_files[frame_idx]))[:, :3].astype(np.float32)
-            radar_local, center = preprocess_radar_frame(radar_data, prev_center=prev_center, rng=rng)
-            radar_local_frames.append(radar_local)
+            radar_features, radar_local_xyz, center = preprocess_radar_frame(
+                radar_data,
+                prev_center=prev_center,
+                rng=rng,
+                radar_channels=radar_channels,
+            )
+            radar_feature_frames.append(radar_features)
+            radar_local_xyz_frames.append(radar_local_xyz)
             centers.append(center)
             gt_global.append(imu_data)
             gt_local.append((imu_data - center).astype(np.float32))
             prev_center = center
 
-        radar_local_frames = np.asarray(radar_local_frames, dtype=np.float32)
+        radar_feature_frames = np.asarray(radar_feature_frames, dtype=np.float32)
+        radar_local_xyz_frames = np.asarray(radar_local_xyz_frames, dtype=np.float32)
         centers = np.asarray(centers, dtype=np.float32)
         gt_global = np.asarray(gt_global, dtype=np.float32)
         gt_local = np.asarray(gt_local, dtype=np.float32)
-        input_windows = build_padded_windows(radar_local_frames)
+        input_windows = build_padded_windows(radar_feature_frames, seq_len=seq_len)
         input_tensor = torch.from_numpy(input_windows).float().permute(0, 1, 3, 2)
 
         predictions_local = []
@@ -367,12 +399,12 @@ def run_inference():
 
         prediction_local = np.concatenate(predictions_local, axis=0).astype(np.float32)
         prediction_global = (prediction_local + centers[:, None, :]).astype(np.float32)
-        radar_global_frames = (radar_local_frames + centers[:, None, :]).astype(np.float32)
+        radar_global_frames = (radar_local_xyz_frames + centers[:, None, :]).astype(np.float32)
 
         np.save(os.path.join(output_group, "prediction.npy"), prediction_global)
         np.save(os.path.join(output_group, "prediction_local.npy"), prediction_local)
         np.save(os.path.join(output_group, "processed_radar.npy"), radar_global_frames)
-        np.save(os.path.join(output_group, "processed_radar_local.npy"), radar_local_frames)
+        np.save(os.path.join(output_group, "processed_radar_local.npy"), radar_local_xyz_frames)
         np.save(os.path.join(output_group, "center.npy"), centers)
         np.save(os.path.join(output_group, "gt.npy"), gt_global)
         np.save(os.path.join(output_group, "gt_local.npy"), gt_local)

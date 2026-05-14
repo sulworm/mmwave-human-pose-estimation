@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import matplotlib
@@ -9,7 +10,7 @@ except Exception:
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Slider
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
@@ -21,7 +22,7 @@ except Exception:
 
 
 class FinalVisualizer:
-    def __init__(self, data_root="Data_With_Pred_mmchain_lite"):
+    def __init__(self, data_root="Data_With_Pred_mmchain_lite_st"):
         self.data_root = data_root
         self.radar_data = None
         self.pred_data = None
@@ -33,13 +34,6 @@ class FinalVisualizer:
         self.current_idx = 0
         self.total_frames = 0
         self.show_layers = [True, True, True, True]  # Radar, Pred, GT, Center
-
-        # 动图保存配置
-        self.save_animation = False
-        self.save_path = None
-        self.save_fps = 20
-        self.save_dpi = 120
-        self.is_saving = False
 
         self.skeleton_bones = [
             (0, 7),
@@ -90,59 +84,10 @@ class FinalVisualizer:
             self.group_id = gid
             print(f"成功加载组 {gid}，共 {self.total_frames} 帧。")
             self.print_collapse_summary()
-            self.configure_save_animation()
             return True
         except Exception as exc:
             print(f"加载数据失败: {exc}")
             return False
-
-    def configure_save_animation(self):
-        """让用户选择是否保存动图，并指定保存位置。"""
-        ans = input("是否保存动图? [y/N]: ").strip().lower()
-        if ans not in {"y", "yes", "1", "true", "是"}:
-            self.save_animation = False
-            print("不保存动图，仅打开交互可视化窗口。")
-            return
-
-        default_dir = os.path.join(os.getcwd(), "animations")
-        default_name = f"group_{self.group_id}_animation.gif"
-        default_path = os.path.join(default_dir, default_name)
-
-        raw_path = input(
-            "请输入保存位置（可输入文件夹或完整文件名；回车默认保存为 "
-            f"{default_path}）: "
-        ).strip().strip('"')
-
-        if not raw_path:
-            save_path = default_path
-        else:
-            save_path = os.path.expanduser(raw_path)
-            # 如果输入的是已有文件夹，或者以路径分隔符结尾，则自动补默认文件名
-            if os.path.isdir(save_path) or save_path.endswith((os.sep, "/", "\\")):
-                save_path = os.path.join(save_path, default_name)
-
-            root, ext = os.path.splitext(save_path)
-            if ext.lower() not in {".gif", ".mp4"}:
-                # 未写扩展名时，默认保存为 GIF
-                save_path = save_path + ".gif"
-
-        save_dir = os.path.dirname(os.path.abspath(save_path))
-        os.makedirs(save_dir, exist_ok=True)
-
-        fps_raw = input(f"请输入动图帧率 FPS（回车默认 {self.save_fps}）: ").strip()
-        if fps_raw:
-            try:
-                fps = int(fps_raw)
-                if fps > 0:
-                    self.save_fps = fps
-                else:
-                    print("FPS 必须为正数，已使用默认值。")
-            except ValueError:
-                print("FPS 输入无效，已使用默认值。")
-
-        self.save_animation = True
-        self.save_path = save_path
-        print(f"动图将保存到: {self.save_path}")
 
     def print_collapse_summary(self):
         pred_root_std = np.std(self.pred_data[:, 0, :], axis=0)
@@ -179,42 +124,6 @@ class FinalVisualizer:
 
     def get_lines(self, points):
         return [[points[start], points[end]] for start, end in self.skeleton_bones]
-
-    def save_current_animation(self, fig):
-        """保存完整序列动图。GIF 使用 Pillow；MP4 使用 ffmpeg。"""
-        if not self.save_animation or not self.save_path:
-            return
-
-        ext = os.path.splitext(self.save_path)[1].lower()
-        if ext == ".gif":
-            writer = PillowWriter(fps=self.save_fps)
-        elif ext == ".mp4":
-            writer = FFMpegWriter(fps=self.save_fps)
-        else:
-            print(f"不支持的保存格式: {ext}，请使用 .gif 或 .mp4")
-            return
-
-        print("开始保存动图，请等待窗口完成逐帧渲染...")
-        old_playing = self.is_playing
-        old_idx = self.current_idx
-        self.is_playing = False
-        self.is_saving = True
-        try:
-            self.anim.save(self.save_path, writer=writer, dpi=self.save_dpi)
-            print(f"动图保存完成: {self.save_path}")
-        except Exception as exc:
-            print(f"动图保存失败: {exc}")
-            if ext == ".mp4":
-                print("提示：保存 MP4 需要系统已安装 ffmpeg；若未安装，建议改存 .gif。")
-        finally:
-            self.is_saving = False
-            self.is_playing = old_playing
-            self.current_idx = old_idx
-            try:
-                self.slider.set_val(self.current_idx)
-            except Exception:
-                pass
-            fig.canvas.draw_idle()
 
     def run(self):
         if not self.select_group():
@@ -258,7 +167,15 @@ class FinalVisualizer:
         pred_root_std = np.std(self.pred_data[:, 0, :], axis=0).mean()
         gt_root_std = np.std(self.gt_data[:, 0, :], axis=0).mean()
 
-        def draw_frame(idx):
+        def update(_frame):
+            if self.is_playing:
+                self.current_idx = (self.current_idx + 1) % self.total_frames
+                self.slider.eventson = False
+                self.slider.set_val(self.current_idx)
+                self.slider.eventson = True
+
+            idx = self.current_idx
+
             if self.show_layers[0]:
                 radar = self.radar_data[idx]
                 mask = np.any(np.abs(radar) > 1e-6, axis=1)
@@ -293,7 +210,7 @@ class FinalVisualizer:
             gt = self.gt_data[idx]
             mpjpe = np.mean(np.linalg.norm(pred - gt, axis=1))
             root_err = np.linalg.norm(pred[0] - gt[0])
-            state = "Saving" if self.is_saving else ("Play" if self.is_playing else "Pause")
+            state = "Play" if self.is_playing else "Pause"
             txt_info.set_text(
                 f"Frame: {idx}/{self.total_frames - 1}\n"
                 f"State: {state}\n"
@@ -301,21 +218,6 @@ class FinalVisualizer:
                 f"Root Err: {root_err:.3f}m\n"
                 f"Root Std P/G: {pred_root_std:.3f}/{gt_root_std:.3f}"
             )
-
-        def update(frame):
-            if self.is_saving:
-                self.current_idx = int(frame) % self.total_frames
-                self.slider.eventson = False
-                self.slider.set_val(self.current_idx)
-                self.slider.eventson = True
-            elif self.is_playing:
-                self.current_idx = (self.current_idx + 1) % self.total_frames
-                self.slider.eventson = False
-                self.slider.set_val(self.current_idx)
-                self.slider.eventson = True
-
-            draw_frame(self.current_idx)
-            return scat_radar, scat_pred, line_pred, scat_gt, line_gt, scat_center, txt_info
 
         def on_key(event):
             if event.key == " ":
@@ -340,13 +242,22 @@ class FinalVisualizer:
                     pass
 
         fig.canvas.mpl_connect("key_press_event", on_key)
-        self.anim = FuncAnimation(fig, update, frames=range(self.total_frames), interval=50, cache_frame_data=False)
-
-        # 如果用户选择保存，则先保存完整动图，再打开交互窗口。
-        self.save_current_animation(fig)
-
+        self.anim = FuncAnimation(fig, update, interval=50, cache_frame_data=False)
         plt.show()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_root",
+        "--pred_dir",
+        dest="data_root",
+        default="Data_With_Pred",
+        help="Prediction output directory produced by inference.py.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    FinalVisualizer().run()
+    args = parse_args()
+    FinalVisualizer(data_root=args.data_root).run()

@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 AGENT.md
+*.md
 
 # Python environments
 .venv/
@@ -15,7 +16,11 @@ env/
 # Data, generated outputs, and model artifacts
 Data_Matched/
 Data_Aligned/
-Dataset_Ready/
+Dataset_Ready*/
+Data_With_Pred*/
+Training_Results*/
+animations/
+mmchain优化方法参考/
 *.npy
 *.npz
 *.pth
@@ -29,11 +34,3 @@ Dataset_Ready/
 *.log
 .DS_Store
 Thumbs.db
-
-# Generated outputs intentionally published with the project
-!Data_With_Pred/
-!Data_With_Pred/**
-!Training_Results/
-!Training_Results/**
-!animations/
-!animations/**

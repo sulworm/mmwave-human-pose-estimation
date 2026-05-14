@@ -12,12 +12,15 @@ from tqdm import tqdm
 
 SOURCE_DIR = "Data_Aligned"
 SAVE_DIR = "Dataset_Ready"
-SEQ_LEN = 10
+SEQ_LEN = 5
 NUM_POINTS = 128
 SEED = 42
 TEST_RATIO = 0.2
 DEFAULT_GROUPS = "54-108,131-204"
 DEFAULT_EXCLUDE_GROUPS = "5-44,111-126"
+RADAR_CHANNEL_CHOICES = ("xyz", "xyzv", "xyzvsnr")
+VELOCITY_CLIP = 1.5
+SNR_LOG_SCALE = 12.0
 
 LOCAL_CROP_BOX = 1.5
 GLOBAL_Z_RANGE = (-0.5, 2.5)
@@ -121,6 +124,40 @@ def filter_group_ids(group_ids, include_spec=DEFAULT_GROUPS, exclude_spec=DEFAUL
     return sort_group_ids(group_ids)
 
 
+def radar_channel_count(radar_channels):
+    if radar_channels == "xyz":
+        return 3
+    if radar_channels == "xyzv":
+        return 4
+    if radar_channels == "xyzvsnr":
+        return 5
+    raise ValueError(f"Unsupported radar_channels: {radar_channels}")
+
+
+def select_radar_channels(radar_data, radar_channels):
+    feature_count = radar_channel_count(radar_channels)
+    features = np.zeros((radar_data.shape[0], feature_count), dtype=np.float32)
+    copy_count = min(feature_count, radar_data.shape[1])
+    if copy_count > 0:
+        features[:, :copy_count] = radar_data[:, :copy_count].astype(np.float32)
+    if feature_count >= 4:
+        features[:, 3] = np.clip(features[:, 3], -VELOCITY_CLIP, VELOCITY_CLIP) / VELOCITY_CLIP
+    if feature_count >= 5:
+        features[:, 4] = np.log1p(np.maximum(features[:, 4], 0.0)) / SNR_LOG_SCALE
+    return features
+
+
+def rough_point_mask(points_xyz):
+    return (
+        (points_xyz[:, 0] >= ROUGH_XY_RANGE[0])
+        & (points_xyz[:, 0] <= ROUGH_XY_RANGE[1])
+        & (points_xyz[:, 1] >= ROUGH_XY_RANGE[0])
+        & (points_xyz[:, 1] <= ROUGH_XY_RANGE[1])
+        & (points_xyz[:, 2] >= ROUGH_Z_RANGE[0])
+        & (points_xyz[:, 2] <= ROUGH_Z_RANGE[1])
+    )
+
+
 def split_groups(group_ids, test_ratio=TEST_RATIO, seed=SEED):
     buckets = {}
     for group_id in sort_group_ids(group_ids):
@@ -151,14 +188,7 @@ def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
         center = np.zeros(3, dtype=np.float32) if prev_center is None else prev_center.astype(np.float32)
         return center, np.zeros((0, 3), dtype=np.float32)
 
-    rough_mask = (
-        (points_xyz[:, 0] >= ROUGH_XY_RANGE[0])
-        & (points_xyz[:, 0] <= ROUGH_XY_RANGE[1])
-        & (points_xyz[:, 1] >= ROUGH_XY_RANGE[0])
-        & (points_xyz[:, 1] <= ROUGH_XY_RANGE[1])
-        & (points_xyz[:, 2] >= ROUGH_Z_RANGE[0])
-        & (points_xyz[:, 2] <= ROUGH_Z_RANGE[1])
-    )
+    rough_mask = rough_point_mask(points_xyz)
     valid_points = points_xyz[rough_mask]
     if valid_points.shape[0] == 0:
         valid_points = points_xyz
@@ -176,7 +206,8 @@ def estimate_center(points_xyz, prev_center=None, ema_alpha=0.2):
 
 def crop_local_points(local_points):
     if local_points.size == 0:
-        return np.zeros((0, 3), dtype=np.float32)
+        feature_count = local_points.shape[1] if local_points.ndim == 2 else 3
+        return np.zeros((0, feature_count), dtype=np.float32)
 
     mask = (
         (local_points[:, 0] >= -LOCAL_CROP_BOX)
@@ -190,6 +221,7 @@ def crop_local_points(local_points):
 
 
 def sample_or_pad(points_xyz, rng, num_points=NUM_POINTS):
+    feature_count = points_xyz.shape[1] if points_xyz.ndim == 2 else 3
     point_count = points_xyz.shape[0]
     if point_count >= num_points:
         indices = rng.choice(point_count, num_points, replace=False)
@@ -198,13 +230,18 @@ def sample_or_pad(points_xyz, rng, num_points=NUM_POINTS):
         extra_indices = rng.choice(point_count, num_points - point_count, replace=True)
         sampled = np.vstack([points_xyz, points_xyz[extra_indices]])
         return sampled.astype(np.float32)
-    return np.zeros((num_points, 3), dtype=np.float32)
+    return np.zeros((num_points, feature_count), dtype=np.float32)
 
 
-def preprocess_frame(radar_data, imu_data, prev_center, rng):
+def preprocess_frame(radar_data, imu_data, prev_center, rng, radar_channels="xyzvsnr"):
     points_xyz = radar_data[:, :3].astype(np.float32)
     center, valid_world = estimate_center(points_xyz, prev_center=prev_center)
-    radar_local = crop_local_points(valid_world - center)
+    rough_mask = rough_point_mask(points_xyz)
+    if points_xyz.shape[0] > 0 and not np.any(rough_mask):
+        rough_mask = np.ones(points_xyz.shape[0], dtype=bool)
+    radar_features = select_radar_channels(radar_data[rough_mask], radar_channels)
+    radar_features[:, :3] = valid_world - center
+    radar_local = crop_local_points(radar_features)
     radar_sampled = sample_or_pad(radar_local, rng=rng)
 
     pose_global = imu_data[:, :3].astype(np.float32)
@@ -227,7 +264,7 @@ def safe_concat(blocks, tail_shape):
     return np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
 
 
-def build_dataset_for_groups(source_dir, group_ids, rng):
+def build_dataset_for_groups(source_dir, group_ids, rng, radar_channels="xyzvsnr", seq_len=SEQ_LEN):
     radar_window_blocks = []
     pose_local_window_blocks = []
     pose_global_window_blocks = []
@@ -247,7 +284,7 @@ def build_dataset_for_groups(source_dir, group_ids, rng):
         radar_files = sorted(name for name in os.listdir(radar_dir) if name.endswith(".npy"))
         imu_files = sorted(name for name in os.listdir(imu_dir) if name.endswith(".npy"))
         frame_count = min(len(radar_files), len(imu_files))
-        if frame_count < SEQ_LEN:
+        if frame_count < seq_len:
             continue
 
         frame_radars = []
@@ -260,7 +297,11 @@ def build_dataset_for_groups(source_dir, group_ids, rng):
             radar_data = np.load(os.path.join(radar_dir, radar_files[frame_idx]))
             imu_data = np.load(os.path.join(imu_dir, imu_files[frame_idx]))
             radar_local, pose_local, pose_global, center = preprocess_frame(
-                radar_data, imu_data, prev_center=prev_center, rng=rng
+                radar_data,
+                imu_data,
+                prev_center=prev_center,
+                rng=rng,
+                radar_channels=radar_channels,
             )
             frame_radars.append(radar_local)
             frame_pose_local.append(pose_local)
@@ -268,10 +309,10 @@ def build_dataset_for_groups(source_dir, group_ids, rng):
             frame_centers.append(center)
             prev_center = center
 
-        radar_group_windows = build_windows(frame_radars)
-        pose_local_group_windows = build_windows(frame_pose_local)
-        pose_global_group_windows = build_windows(frame_pose_global)
-        center_group_windows = build_windows(frame_centers)
+        radar_group_windows = build_windows(frame_radars, seq_len=seq_len)
+        pose_local_group_windows = build_windows(frame_pose_local, seq_len=seq_len)
+        pose_global_group_windows = build_windows(frame_pose_global, seq_len=seq_len)
+        center_group_windows = build_windows(frame_centers, seq_len=seq_len)
         sample_count = radar_group_windows.shape[0]
         bucket_name = action_bucket(group_id)
 
@@ -291,22 +332,27 @@ def build_dataset_for_groups(source_dir, group_ids, rng):
             "bucket": bucket_name,
         }
 
+    radar_feature_count = radar_channel_count(radar_channels)
     return {
-        "radar": torch.from_numpy(safe_concat(radar_window_blocks, (SEQ_LEN, NUM_POINTS, 3))),
-        "pose_local": torch.from_numpy(safe_concat(pose_local_window_blocks, (SEQ_LEN, 13, 3))),
-        "pose_global": torch.from_numpy(safe_concat(pose_global_window_blocks, (SEQ_LEN, 13, 3))),
-        "center": torch.from_numpy(safe_concat(center_window_blocks, (SEQ_LEN, 3))),
+        "radar": torch.from_numpy(safe_concat(radar_window_blocks, (seq_len, NUM_POINTS, radar_feature_count))),
+        "pose_local": torch.from_numpy(safe_concat(pose_local_window_blocks, (seq_len, 13, 3))),
+        "pose_global": torch.from_numpy(safe_concat(pose_global_window_blocks, (seq_len, 13, 3))),
+        "center": torch.from_numpy(safe_concat(center_window_blocks, (seq_len, 3))),
         "groups": sample_groups,
         "sample_buckets": sample_buckets,
         "start_frames": sample_start_frames,
         "group_summaries": group_summaries,
         "config": {
             "source_dir": source_dir,
-            "seq_len": SEQ_LEN,
+            "seq_len": seq_len,
             "num_points": NUM_POINTS,
             "seed": SEED,
             "groups": DEFAULT_GROUPS,
             "exclude_groups": DEFAULT_EXCLUDE_GROUPS,
+            "radar_channels": radar_channels,
+            "radar_feature_count": radar_feature_count,
+            "velocity_clip": VELOCITY_CLIP,
+            "snr_log_scale": SNR_LOG_SCALE,
             "label_mode": "pose_local_equals_global_pose_minus_planar_radar_center",
             "sample_mode": "repeat_points_when_sparse_zero_only_when_empty",
         },
@@ -319,8 +365,15 @@ def parse_args():
     parser.add_argument("--save_dir", default=SAVE_DIR)
     parser.add_argument("--test_ratio", type=float, default=TEST_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
     parser.add_argument("--groups", default=DEFAULT_GROUPS, help="Included group ids/ranges, or 'all'.")
     parser.add_argument("--exclude_groups", default=DEFAULT_EXCLUDE_GROUPS, help="Excluded group ids/ranges.")
+    parser.add_argument(
+        "--radar_channels",
+        choices=RADAR_CHANNEL_CHOICES,
+        default="xyzvsnr",
+        help="Radar feature channels saved to Dataset_Ready. Default keeps XYZ, velocity, and log-scaled SNR.",
+    )
     return parser.parse_args()
 
 
@@ -344,18 +397,34 @@ def main():
     print(f"测试组列表: {test_groups}")
 
     rng = np.random.default_rng(args.seed)
-    train_data = build_dataset_for_groups(args.source_dir, train_groups, rng)
-    test_data = build_dataset_for_groups(args.source_dir, test_groups, rng)
+    train_data = build_dataset_for_groups(
+        args.source_dir,
+        train_groups,
+        rng,
+        radar_channels=args.radar_channels,
+        seq_len=args.seq_len,
+    )
+    test_data = build_dataset_for_groups(
+        args.source_dir,
+        test_groups,
+        rng,
+        radar_channels=args.radar_channels,
+        seq_len=args.seq_len,
+    )
     train_data["config"]["groups"] = args.groups
     train_data["config"]["exclude_groups"] = args.exclude_groups
+    train_data["config"]["radar_channels"] = args.radar_channels
+    train_data["config"]["seq_len"] = args.seq_len
     test_data["config"]["groups"] = args.groups
     test_data["config"]["exclude_groups"] = args.exclude_groups
+    test_data["config"]["radar_channels"] = args.radar_channels
+    test_data["config"]["seq_len"] = args.seq_len
 
     if train_data["radar"].shape[0] == 0:
         print("错误：没有生成训练样本，请检查 Data_Aligned。")
         return
     if test_data["radar"].shape[0] == 0:
-        print("错误：没有生成测试样本，请检查分组或 SEQ_LEN。")
+        print("错误：没有生成测试样本，请检查分组或 seq_len。")
         return
 
     split_info = {
@@ -363,8 +432,11 @@ def main():
         "save_dir": args.save_dir,
         "seed": args.seed,
         "test_ratio": args.test_ratio,
+        "seq_len": args.seq_len,
         "groups": args.groups,
         "exclude_groups": args.exclude_groups,
+        "radar_channels": args.radar_channels,
+        "radar_feature_count": radar_channel_count(args.radar_channels),
         "source_groups": all_source_groups,
         "all_groups": group_ids,
         "train_groups": train_groups,
